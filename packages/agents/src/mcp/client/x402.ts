@@ -42,7 +42,9 @@ import type {
   PaymentPayload,
   PaymentRequirements,
   PaymentRequired,
-  Network
+  Network,
+  SchemeNetworkClient,
+  SchemeNetworkServer
 } from "@x402/core/types";
 
 // v2 imports from @x402/evm
@@ -67,7 +69,9 @@ const LEGACY_NETWORK_MAP: Record<string, string> = {
   "base-sepolia": "eip155:84532",
   base: "eip155:8453",
   ethereum: "eip155:1",
-  sepolia: "eip155:11155111"
+  sepolia: "eip155:11155111",
+  solana: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+  "solana-devnet": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
 };
 
 /**
@@ -78,9 +82,40 @@ export function normalizeNetwork(network: string): Network {
   return (LEGACY_NETWORK_MAP[network] ?? network) as Network;
 }
 
+const BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+/**
+ * Reject a recipient whose format belongs to a different chain family than
+ * the network, e.g. a Solana address configured for Base. The facilitator
+ * still performs the authoritative check.
+ */
+function assertRecipientMatchesNetwork(network: Network, recipient: string) {
+  if (typeof recipient !== "string" || recipient === "") {
+    throw new TypeError("x402 recipient is required");
+  }
+  if (network.startsWith("eip155:") && !recipient.startsWith("0x")) {
+    throw new TypeError(
+      `x402 recipient for ${network} must be a 0x-prefixed EVM address`
+    );
+  }
+  if (network.startsWith("solana:") && !BASE58_ADDRESS.test(recipient)) {
+    throw new TypeError(
+      `x402 recipient for ${network} must be a base58 Solana address`
+    );
+  }
+}
+
 /*
   ======= SERVER SIDE =======
 */
+
+/** A server-side payment scheme to register for a network pattern. */
+export type X402ServerSchemeRegistration = {
+  /** CAIP-2 network or wildcard pattern, e.g. "solana:*" */
+  network: Network;
+  /** e.g. `new ExactSvmScheme()` from `@x402/svm/exact/server` */
+  server: SchemeNetworkServer;
+};
 
 export type X402Config = {
   /**
@@ -88,10 +123,20 @@ export type X402Config = {
    * Accepts both legacy names ("base-sepolia") and CAIP-2 format ("eip155:84532").
    */
   network: string;
-  /** Payment recipient address */
-  recipient: `0x${string}`;
+  /**
+   * Payment recipient address: a 0x address on EVM networks, a base58
+   * address on Solana. A Solana recipient must already hold a token account
+   * for the payment asset (e.g. USDC), or verification fails.
+   */
+  recipient: string;
   /** Facilitator configuration. Defaults to https://x402.org/facilitator */
   facilitator?: FacilitatorConfig;
+  /**
+   * Payment schemes for non-EVM networks. The exact EVM scheme is always
+   * registered. For Solana, register `ExactSvmScheme` from
+   * `@x402/svm/exact/server` for `"solana:*"`.
+   */
+  schemes?: X402ServerSchemeRegistration[];
   /** @deprecated No longer used in v2. The protocol version is determined automatically. */
   version?: number;
 };
@@ -193,6 +238,7 @@ export function withX402(
   cfg: X402Config
 ): (McpServer | V2McpServer) & X402AugmentedServer<McpServer | V2McpServer> {
   const network = normalizeNetwork(cfg.network);
+  assertRecipientMatchesNetwork(network, cfg.recipient);
   const facilitatorConfig: FacilitatorConfig = cfg.facilitator ?? {
     url: "https://x402.org/facilitator"
   };
@@ -201,6 +247,16 @@ export function withX402(
   const facilitatorClient = new HTTPFacilitatorClient(facilitatorConfig);
   const resourceServer = new x402ResourceServer(facilitatorClient);
   registerServerEvmScheme(resourceServer);
+  for (const { network: pattern, server: scheme } of cfg.schemes ?? []) {
+    resourceServer.register(pattern, scheme);
+  }
+  if (!resourceServer.hasRegisteredScheme(network, "exact")) {
+    throw new Error(
+      `No x402 "exact" scheme is registered for ${network}. For Solana, add ` +
+        `{ network: "solana:*", server: new ExactSvmScheme() } from ` +
+        `"@x402/svm/exact/server" to schemes.`
+    );
+  }
 
   // Lazy initialization: fetch supported kinds from facilitator on first use
   let initPromise: Promise<void> | null = null;
@@ -415,15 +471,30 @@ export interface X402AugmentedClient {
   ): Promise<CallToolResult>;
 }
 
+/** A client-side payment scheme to register for a network pattern. */
+export type X402ClientSchemeRegistration = {
+  /** CAIP-2 network or wildcard pattern, e.g. "solana:*" */
+  network: Network;
+  /** e.g. `new ExactSvmScheme(signer, { rpcUrl })` from `@x402/svm/exact/client` */
+  client: SchemeNetworkClient;
+};
+
 export type X402ClientConfig = {
   /**
    * EVM account/signer for signing payment authorizations.
    * Use `privateKeyToAccount()` from viem/accounts to create one.
+   * Optional when `schemes` covers the networks you pay on.
    */
-  account: ClientEvmSigner;
+  account?: ClientEvmSigner;
+  /**
+   * Payment schemes for non-EVM networks, e.g. `ExactSvmScheme` from
+   * `@x402/svm/exact/client` for `"solana:*"`. Only the `exact` scheme is
+   * checked against `maxPaymentValue`; other schemes are not signed.
+   */
+  schemes?: X402ClientSchemeRegistration[];
   /**
    * Preferred network identifier (optional).
-   * Accepts both legacy names ("base-sepolia") and CAIP-2 format ("eip155:84532").
+   * Accepts both legacy names ("base-sepolia", "solana-devnet") and CAIP-2 format ("eip155:84532").
    * When set, the client prefers payment requirements matching this network.
    * If omitted, the client automatically selects from available requirements.
    */
@@ -446,13 +517,21 @@ export function withX402Client<T extends CompatibleMcpClient>(
   x402Config: X402ClientConfig
 ): X402AugmentedClient & T {
   const invoker = bindMcpClient(client);
-  const { account } = x402Config;
+  const { account, schemes = [] } = x402Config;
+  if (!account && schemes.length === 0) {
+    throw new TypeError(
+      "withX402Client needs an EVM account, payment schemes, or both"
+    );
+  }
 
   const maxPaymentValue = x402Config.maxPaymentValue ?? BigInt(100_000); // 0.10 USDC
 
-  // Create v2 x402 payment client with EVM scheme support
+  // Create v2 x402 payment client with EVM and any configured schemes
   const paymentClient = new x402Client();
-  registerClientEvmScheme(paymentClient, { signer: account });
+  if (account) registerClientEvmScheme(paymentClient, { signer: account });
+  for (const { network, client: scheme } of schemes) {
+    paymentClient.register(network, scheme);
+  }
 
   // Payment requests whose selection reached the hook below. x402 selects a
   // requirement before it runs any hook, so a request that failed without

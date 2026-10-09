@@ -35,6 +35,8 @@ const requirement = {
 };
 
 const mockResourceServer = {
+  register: vi.fn(),
+  hasRegisteredScheme: vi.fn(() => true),
   initialize: vi.fn(),
   buildPaymentRequirements: vi.fn(),
   findMatchingRequirements: vi.fn(),

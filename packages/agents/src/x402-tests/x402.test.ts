@@ -7,6 +7,8 @@ import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 // --- Mock setup for @x402 modules ---
 
 const mockResourceServer = {
+  register: vi.fn(),
+  hasRegisteredScheme: vi.fn(() => true),
   initialize: vi.fn().mockResolvedValue(undefined),
   buildPaymentRequirements: vi.fn(),
   findMatchingRequirements: vi.fn(),
@@ -15,6 +17,7 @@ const mockResourceServer = {
 };
 
 const mockPaymentClient = {
+  register: vi.fn(),
   onBeforePaymentCreation: vi.fn(),
   registerPolicy: vi.fn(),
   createPaymentPayload: vi.fn()
@@ -41,6 +44,8 @@ vi.mock("@x402/evm/exact/client", () => ({
   registerExactEvmScheme: vi.fn()
 }));
 
+import { registerExactEvmScheme as registerServerEvmScheme } from "@x402/evm/exact/server";
+import { registerExactEvmScheme as registerClientEvmScheme } from "@x402/evm/exact/client";
 import {
   normalizeNetwork,
   withX402,
@@ -110,6 +115,9 @@ const mockSigner = {
   signTypedData: vi.fn()
 };
 
+const SOLANA_DEVNET = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+const SOLANA_RECIPIENT = "1nc1nerator11111111111111111111111111111111";
+
 // =============================================================
 // normalizeNetwork
 // =============================================================
@@ -128,6 +136,15 @@ describe("normalizeNetwork", () => {
 
   it("converts legacy 'sepolia' to CAIP-2", () => {
     expect(normalizeNetwork("sepolia")).toBe("eip155:11155111");
+  });
+
+  it("converts legacy Solana names to CAIP-2", () => {
+    expect(normalizeNetwork("solana")).toBe(
+      "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+    );
+    expect(normalizeNetwork("solana-devnet")).toBe(
+      "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+    );
   });
 
   it("passes through CAIP-2 identifiers unchanged", () => {
@@ -655,6 +672,77 @@ describe("withX402", () => {
       expect.objectContaining({ network: "eip155:84532" })
     );
   });
+
+  it("registers configured schemes alongside the EVM scheme", () => {
+    const svmScheme = { scheme: "exact" } as never;
+    withX402(createMockMcpServer(), {
+      network: "solana-devnet",
+      recipient: SOLANA_RECIPIENT,
+      schemes: [{ network: "solana:*", server: svmScheme }]
+    });
+
+    expect(registerServerEvmScheme).toHaveBeenCalledWith(mockResourceServer);
+    expect(mockResourceServer.register).toHaveBeenCalledWith(
+      "solana:*",
+      svmScheme
+    );
+    expect(mockResourceServer.hasRegisteredScheme).toHaveBeenCalledWith(
+      SOLANA_DEVNET,
+      "exact"
+    );
+  });
+
+  it("builds Solana requirements with the base58 recipient", async () => {
+    const server = createMockMcpServer();
+    const augmented = withX402(server, {
+      network: SOLANA_DEVNET,
+      recipient: SOLANA_RECIPIENT,
+      schemes: [{ network: "solana:*", server: { scheme: "exact" } as never }]
+    });
+    mockResourceServer.buildPaymentRequirements.mockResolvedValue([]);
+
+    augmented.paidTool("paid-tool", "Test", 0.01, {}, {}, async () => ({
+      content: [{ type: "text" as const, text: "ok" }]
+    }));
+    await getRegisteredCallback(server)({}, {});
+
+    expect(mockResourceServer.buildPaymentRequirements).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scheme: "exact",
+        network: SOLANA_DEVNET,
+        payTo: SOLANA_RECIPIENT
+      })
+    );
+  });
+
+  it("throws when no exact scheme is registered for the network", () => {
+    mockResourceServer.hasRegisteredScheme.mockReturnValueOnce(false);
+
+    expect(() =>
+      withX402(createMockMcpServer(), {
+        network: SOLANA_DEVNET,
+        recipient: SOLANA_RECIPIENT
+      })
+    ).toThrow(/No x402 "exact" scheme is registered for solana:/);
+  });
+
+  it.each([
+    {
+      network: "solana-devnet",
+      recipient: "0x1111111111111111111111111111111111111111"
+    },
+    { network: SOLANA_DEVNET, recipient: "not-base58-0OIl" },
+    { network: "base-sepolia", recipient: SOLANA_RECIPIENT },
+    { network: "base-sepolia", recipient: undefined as unknown as string }
+  ])(
+    "rejects recipient $recipient for network $network",
+    ({ network, recipient }) => {
+      expect(() =>
+        withX402(createMockMcpServer(), { network, recipient })
+      ).toThrow(TypeError);
+      expect(mockResourceServer.register).not.toHaveBeenCalled();
+    }
+  );
 });
 
 // =============================================================
@@ -1022,5 +1110,55 @@ describe("withX402Client", () => {
         version: 1
       })
     ).not.toThrow();
+  });
+
+  it("registers configured schemes without an EVM account", () => {
+    const svmScheme = { scheme: "exact" } as never;
+    withX402Client(createMockMcpClient(), {
+      schemes: [{ network: "solana:*", client: svmScheme }]
+    });
+
+    expect(registerClientEvmScheme).not.toHaveBeenCalled();
+    expect(mockPaymentClient.register).toHaveBeenCalledWith(
+      "solana:*",
+      svmScheme
+    );
+  });
+
+  it("registers configured schemes alongside the EVM account", () => {
+    const svmScheme = { scheme: "exact" } as never;
+    withX402Client(createMockMcpClient(), {
+      account: mockSigner as unknown as X402ClientConfig["account"],
+      schemes: [{ network: "solana:*", client: svmScheme }]
+    });
+
+    expect(registerClientEvmScheme).toHaveBeenCalledWith(mockPaymentClient, {
+      signer: mockSigner
+    });
+    expect(mockPaymentClient.register).toHaveBeenCalledWith(
+      "solana:*",
+      svmScheme
+    );
+  });
+
+  it("throws when neither an account nor schemes are configured", () => {
+    expect(() => withX402Client(createMockMcpClient(), {})).toThrow(TypeError);
+    expect(() =>
+      withX402Client(createMockMcpClient(), { schemes: [] })
+    ).toThrow(TypeError);
+  });
+
+  it("normalizes a legacy Solana network preference", () => {
+    withX402Client(createMockMcpClient(), {
+      schemes: [{ network: "solana:*", client: { scheme: "exact" } as never }],
+      network: "solana-devnet"
+    });
+
+    const policyFn = mockPaymentClient.registerPolicy.mock.calls[0][0];
+    const reqs = [
+      { network: "eip155:84532", scheme: "exact" },
+      { network: SOLANA_DEVNET, scheme: "exact" }
+    ];
+    expect(policyFn(2, reqs)).toEqual([reqs[1]]);
   });
 });
