@@ -116,7 +116,7 @@ function App() {
           Array.isArray(parsed.requirements)
         ) {
           const p = parsed.requirements[0] || {};
-          const amt = (Number(p.maxAmountRequired) / 1e6).toString();
+          const amt = (Number(p.amount) / 1e6).toString();
           setPayment({
             resource: p.resource || "—",
             address: p.payTo || "—",
