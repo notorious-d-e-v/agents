@@ -7,25 +7,47 @@ import { HTTPFacilitatorClient } from "@x402/core/server";
 import { registerExactEvmScheme as registerClientEvmScheme } from "@x402/evm/exact/client";
 import { registerExactEvmScheme as registerServerEvmScheme } from "@x402/evm/exact/server";
 import { toClientEvmSigner } from "@x402/evm";
+import { ExactSvmScheme as ExactSvmClientScheme } from "@x402/svm/exact/client";
+import { registerExactSvmScheme as registerServerSvmScheme } from "@x402/svm/exact/server";
+import { createKeyPairSignerFromBytes, getBase58Encoder } from "@solana/kit";
 import { privateKeyToAccount } from "viem/accounts";
+
+const BASE_SEPOLIA = "eip155:84532";
+const SOLANA_DEVNET = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 
 export class PayAgent extends Agent<Env> {
   fetchWithPay?: ReturnType<typeof wrapFetchWithPayment>;
 
-  onStart() {
+  async onStart() {
     const pk = process.env.CLIENT_TEST_PK;
-    if (!pk) {
+    const solanaKey = process.env.CLIENT_SOLANA_TEST_KEY;
+    if (!pk && !solanaKey) {
       console.warn(
-        "CLIENT_TEST_PK not set — copy .env.example to .env and add a test private key"
+        "CLIENT_TEST_PK and CLIENT_SOLANA_TEST_KEY not set — copy .env.example to .env and add a test key"
       );
       return;
     }
 
-    const account = privateKeyToAccount(pk as `0x${string}`);
-    console.log("Agent will pay from:", account.address);
-
     const client = new x402Client();
-    registerClientEvmScheme(client, { signer: toClientEvmSigner(account) });
+    if (pk) {
+      const account = privateKeyToAccount(pk as `0x${string}`);
+      console.log("Agent will pay on Base Sepolia from:", account.address);
+      registerClientEvmScheme(client, { signer: toClientEvmSigner(account) });
+    }
+    if (solanaKey) {
+      const signer = await createKeyPairSignerFromBytes(
+        getBase58Encoder().encode(solanaKey)
+      );
+      console.log("Agent will pay on Solana devnet from:", signer.address);
+      // The Solana client fetches a recent blockhash over RPC. The public
+      // devnet RPC rejects requests from deployed Workers; set SOLANA_RPC_URL.
+      client.register(
+        "solana:*",
+        new ExactSvmClientScheme(signer, {
+          rpcUrl: process.env.SOLANA_RPC_URL || undefined
+        })
+      );
+    }
     this.fetchWithPay = wrapFetchWithPayment(fetch, client);
   }
 
@@ -56,19 +78,27 @@ const facilitatorClient = new HTTPFacilitatorClient({
 });
 const resourceServer = new x402ResourceServer(facilitatorClient);
 registerServerEvmScheme(resourceServer);
+registerServerSvmScheme(resourceServer);
+
+// Accept payment on each network that has a recipient configured. A Solana
+// recipient must already hold a devnet USDC token account.
+const accepts = [
+  { network: BASE_SEPOLIA, payTo: process.env.SERVER_ADDRESS },
+  { network: SOLANA_DEVNET, payTo: process.env.SERVER_SOLANA_ADDRESS }
+]
+  .filter((option) => option.payTo)
+  .map(({ network, payTo }) => ({
+    scheme: "exact",
+    price: "$0.10",
+    network: network as `${string}:${string}`,
+    payTo: payTo as string
+  }));
 
 app.use(
   paymentMiddleware(
     {
       "GET /protected-route": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.10",
-            network: "eip155:84532",
-            payTo: process.env.SERVER_ADDRESS as `0x${string}`
-          }
-        ],
+        accepts,
         description: "Access to premium content",
         mimeType: "application/json"
       }

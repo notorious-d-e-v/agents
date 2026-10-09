@@ -202,8 +202,8 @@ function App() {
                     <code className="text-xs px-1 py-0.5 rounded bg-kumo-elevated font-mono">
                       /protected-route
                     </code>{" "}
-                    and automatically sign a $0.10 payment on Base Sepolia using
-                    its configured wallet.
+                    and automatically sign a $0.10 payment on Base Sepolia or
+                    Solana devnet using its configured wallet.
                   </Text>
                 </span>
                 <Button

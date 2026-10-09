@@ -24,6 +24,15 @@ You need:
 - `MCP_ADDRESS` — an Ethereum address to receive payments (Base Sepolia testnet)
 - `CLIENT_TEST_PK` — a private key for signing payments (test key only)
 
+To charge on Solana devnet instead, set:
+
+- `MCP_NETWORK=solana-devnet`
+- `MCP_ADDRESS` — a Solana address to receive payments. It must already hold a devnet USDC token account; the payment does not create one, and verification fails without it. Receiving devnet USDC once from https://faucet.circle.com/ creates it.
+- `CLIENT_SOLANA_TEST_KEY` — a base58 secret key for signing payments (test key only). It needs devnet USDC but no SOL; the facilitator pays the transaction fee.
+- `SOLANA_RPC_URL` (optional) — the Solana client fetches a recent blockhash over RPC. The public devnet RPC rejects requests from Workers, including `vite dev`, so point this at an RPC provider that accepts them.
+
+The facilitator must support Solana devnet; https://x402.org/facilitator does.
+
 Then:
 
 ```sh
@@ -62,6 +71,21 @@ server.paidTool(
 );
 ```
 
+#### Solana
+
+`withX402` always registers the EVM scheme. For Solana, pass the SVM scheme
+from `@x402/svm` and a base58 recipient:
+
+```typescript
+import { ExactSvmScheme } from "@x402/svm/exact/server";
+
+const server = withX402(new McpServer({ name: "PayMCP", version: "1.0.0" }), {
+  network: "solana-devnet", // or "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+  recipient: "YourSolanaAddress",
+  schemes: [{ network: "solana:*", server: new ExactSvmScheme() }]
+});
+```
+
 ### Client agent: calling paid tools
 
 ```typescript
@@ -82,6 +106,24 @@ export class PayAgent extends Agent<Env> {
     this.pendingPayments[confirmationId]?.(confirmed);
   }
 }
+```
+
+To pay on Solana, give `withX402Client` the SVM client scheme. `account` is
+optional when `schemes` covers the network:
+
+```typescript
+import { ExactSvmScheme } from "@x402/svm/exact/client";
+import { createKeyPairSignerFromBytes, getBase58Encoder } from "@solana/kit";
+
+const signer = await createKeyPairSignerFromBytes(
+  getBase58Encoder().encode(secretKey)
+);
+this.x402Client = withX402Client(client, {
+  network: "solana-devnet",
+  schemes: [
+    { network: "solana:*", client: new ExactSvmScheme(signer, { rpcUrl }) }
+  ]
+});
 ```
 
 ### React frontend

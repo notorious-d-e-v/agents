@@ -9,14 +9,23 @@ import {
 } from "agents/x402";
 import { z } from "zod";
 import { toClientEvmSigner } from "@x402/evm";
+import { ExactSvmScheme as ExactSvmClientScheme } from "@x402/svm/exact/client";
+import { ExactSvmScheme as ExactSvmServerScheme } from "@x402/svm/exact/server";
+import { createKeyPairSignerFromBytes, getBase58Encoder } from "@solana/kit";
 import { privateKeyToAccount } from "viem/accounts";
 
 // --- MCP Server with paid tools ---
 
+// "base-sepolia" (default) or "solana-devnet"
+const NETWORK = process.env.MCP_NETWORK || "base-sepolia";
+
 const X402_CONFIG: X402Config = {
-  network: "eip155:84532",
-  recipient: process.env.MCP_ADDRESS as `0x${string}`,
-  facilitator: { url: "https://x402.org/facilitator" }
+  network: NETWORK,
+  // An address on NETWORK. A Solana recipient must already hold a devnet
+  // USDC token account, or verification fails.
+  recipient: process.env.MCP_ADDRESS as string,
+  facilitator: { url: "https://x402.org/facilitator" },
+  schemes: [{ network: "solana:*", server: new ExactSvmServerScheme() }]
 };
 
 export class PayMCP extends McpAgent<Env> {
@@ -58,20 +67,39 @@ export class PayAgent extends Agent<Env> {
 
   async onStart() {
     const pk = process.env.CLIENT_TEST_PK;
-    if (!pk) {
+    const solanaKey = process.env.CLIENT_SOLANA_TEST_KEY;
+    if (!pk && !solanaKey) {
       console.warn(
-        "CLIENT_TEST_PK not set — copy .env.example to .env and add a test private key"
+        "CLIENT_TEST_PK and CLIENT_SOLANA_TEST_KEY not set — copy .env.example to .env and add a test key"
       );
       return;
     }
 
-    const account = privateKeyToAccount(pk as `0x${string}`);
+    const account = pk
+      ? toClientEvmSigner(privateKeyToAccount(pk as `0x${string}`))
+      : undefined;
+    // The Solana client fetches a recent blockhash over RPC. The public
+    // devnet RPC rejects requests from deployed Workers; set SOLANA_RPC_URL.
+    const schemes = solanaKey
+      ? [
+          {
+            network: "solana:*" as const,
+            client: new ExactSvmClientScheme(
+              await createKeyPairSignerFromBytes(
+                getBase58Encoder().encode(solanaKey)
+              ),
+              { rpcUrl: process.env.SOLANA_RPC_URL || undefined }
+            )
+          }
+        ]
+      : [];
 
     const { id } = await this.addMcpServer("pay-mcp", this.env.PayMCP);
 
     this.x402Client = withX402Client(this.mcp.mcpConnections[id].client, {
-      network: "eip155:84532",
-      account: toClientEvmSigner(account)
+      network: NETWORK,
+      account,
+      schemes
     });
   }
 
